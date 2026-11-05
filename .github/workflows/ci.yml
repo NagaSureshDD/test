@@ -1,0 +1,158 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # 1. SECRET SCAN -------------------------------------------------------
+  # Scans only the commits in this PR (base..head) = incremental.
+  # FAILS when: gitleaks finds >=1 secret (--exit-code 1).
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # need full history to diff base..head
+      - name: Gitleaks
+        run: |
+          docker run --rm -v "$PWD:/repo" ghcr.io/gitleaks/gitleaks:latest detect \
+            --source /repo \
+            --log-opts="${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}" \
+            --report-format sarif --report-path /repo/gitleaks.sarif \
+            --redact --exit-code 1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: secret-scan-report
+          path: gitleaks.sarif
+          if-no-files-found: ignore
+
+  # 2. INCREMENTAL SAST --------------------------------------------------
+  # --baseline-commit => only findings NEW since the PR's base are reported.
+  # FAILS when: a new finding exists (--error makes semgrep exit 1).
+  sast:
+    runs-on: ubuntu-latest
+    container: semgrep/semgrep
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Semgrep (diff-aware)
+        run: |
+          semgrep scan \
+            --config p/default \
+            --baseline-commit ${{ github.event.pull_request.base.sha }} \
+            --sarif-output=semgrep.sarif \
+            --error
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sast-report
+          path: semgrep.sarif
+          if-no-files-found: ignore
+
+  # 3. SCA: vulnerabilities + licenses ----------------------------------
+  # Trivy checks dependencies against CVE databases (vuln) and license
+  # classifications (license). License scan needs packages installed.
+  # FAILS when: any finding >= severity threshold (exit-code 1).
+  sca:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install deps (license scan reads installed packages)
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install -r requirements.txt
+      - name: Vulnerability scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true # skip CVEs that have no patch yet
+          format: json
+          output: trivy-vuln.json
+          exit-code: "1"
+      - name: License scan
+        if: always()
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: license
+          severity: HIGH,CRITICAL # Trivy rates restrictive licenses (GPL/AGPL) high
+          format: json
+          output: trivy-license.json
+          exit-code: "1"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sca-reports
+          path: trivy-*.json
+          if-no-files-found: ignore
+
+  # 4. UNIT TESTS (Python -> pytest) -------------------------------------
+  # FAILS when: any test fails OR coverage < 80%.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt -r requirements-dev.txt
+      - run: |
+          pytest \
+            --cov=app --cov-report=term-missing --cov-report=xml \
+            --cov-fail-under=80 \
+            --junitxml=junit.xml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-reports
+          path: |
+            junit.xml
+            coverage.xml
+          if-no-files-found: ignore
+
+  # 5. LINT / FORMAT -----------------------------------------------------
+  # FAILS when: ruff finds a rule violation or code isn't formatted.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements-dev.txt
+      - run: ruff check . --output-format=github
+      - run: ruff format --check .
+
+  # 6. SINGLE REQUIRED CHECK ---------------------------------------------
+  # Mark only THIS job as "required" in branch protection.
+  ci-pass:
+    if: always()
+    needs: [secret-scan, sast, sca, test, lint]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail if any job failed or was cancelled
+        run: |
+          if [[ "${{ contains(needs.*.result, 'failure') }}" == "true" || \
+                "${{ contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
+            echo "One or more CI jobs failed"; exit 1
+          fi
